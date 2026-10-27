@@ -1,111 +1,167 @@
-from openai import OpenAI
 import os 
+from openai import OpenAI
 from dotenv import load_dotenv
-import json
-
+import json 
+from pydantic import BaseModel
+from typing import List
 load_dotenv()
-
-client = OpenAI(
+client=OpenAI(
     api_key=os.getenv("grok_apikey"),
     base_url="https://api.groq.com/openai/v1"
 )
 
-def send_email(to,subject,body):
-    print(f"Sending email to {to} with subject '{subject}' and body '{body}'")
-    return f"Email sent to {to}"
 
+history = []
+instruction = """You are a research assistant that helps the user investigate topics and keep track of what they learn.
+
+Language:
+- Reply in the same language the user writes in.
+Research:
+- Use web search whenever a question needs current or factual information you may not know for sure (prices, news, recent releases, statistics).
+- Don't use web search for simple questions you can answer confidently, or for casual chat.
+- Always mention the sources you used.
+- If you can't find a reliable answer, say so instead of guessing.
+
+Style:
+- Keep answers short and clear. Use bullet points only when listing several items.
+- Don't repeat the question back to the user.
+
+Notes:
+- You have two tools: save_note and list_notes.
+- Call save_note only when the user asks to save or remember something. Don't save notes on your own.
+- Call list_notes when the user asks what they saved or wants to review their notes.
+- After using a tool, confirm briefly what you did."""
+history.append({"role":"developer","content":instruction})
+
+notes = []
+def save_notes(title,content):
+    notes.append({title:content})
+    return "The note has been saved."
+def list_notes():
+    return notes
 tools = [
+    {"type":"browser_search" },
     {
         "type":"function",
-        "name":"send_email",
-        "description":"Send an email to a given recipient with a subject and message.",
+        "name":"save_notes",
+        "description": "Save a note for the user so they can review it later. Use this only when the user explicitly asks to save, remember, or write down something. Do not save information unless the user requests it.",
         "parameters":{
             "type":"object",
             "properties":{
-                "to":{"type":"string","description":"The recipient email address."},
-                "subject":{"type":"string","description":"Email subject line."},
-                "body":{"type":"string","description":"Body of the email message."},
-            },
-            "required":["to","subject","body"],
-            "additionalProperties": False,
+                "title":{"type":"string","description":"Note Title"},
+                "content":{"type":"string","description":"Notes details"}
+                },
+            "required":["title","content"],
+            "additionalProperties":False 
+        }
+            
+        
+    },
+    {
+        "type":"function",
+        "name":"list_notes",
+        "description": "Return all notes the user has saved so far. Use this when the user asks to see, review, or recall their saved notes. Takes no input.",
+        "parameters":{
+            "type":"object",
+            "properties":{},
+            "required":[],
+            "additionalProperties":False 
 
         }
 
     }
 ]
+class format(BaseModel):
+    subject : str
+    Key_Findings : list[str]
+    Sources : list[str]
+    opening_Questions : list[str]
+    Recommendation : str
 
-
-
-history = []
-chunks = []
-text_prompting = [{"role":"system","content":"Never fabricate information or claim that an email was sent unless the email tool confirms success. Never send an email if the recipient's email address is missing."},
-                  {"role":"developer","content":"You are an AI email assistant. Your job is to write and send emails based on the user's instructions. When the user requests an email, determine the recipient, subject, and message body. Use the available send_email tool to send the email. If essential information is missing, ask the user for it."},]
-
-history.extend(text_prompting)
 
 while True:
+    input_text = input("ask ai")
     
-    input_text =input("Enter your prompt (or 'exit' to quit): ")
-    
-    if input_text.lower() =="exit":
+    if input_text.lower() == "exit":
         break
-    
-    history.append({"role":"user","content":input_text})
-    
+    if input_text.lower() == "/rest":
+        history.clear()
+        history.append({"role":"developer","content":instruction})
+        print("A new conversation has been started.")
+        continue
+    if input_text.lower() == "/notes":
+        input_text = "Show me the saved notes"
+    if input_text.lower() == "/brief":
+        Specialized_memory=[m for m in history if isinstance(m,dict) and m.get("role") in ["user","assistant"]]
+        Specialized_input = Specialized_memory[-10:] + [{"role":"user","content":"Write the research brief based on our conversation."}]
+        response_parsed = client.responses.parse(
+            model = "openai/gpt-oss-20b",
+            instructions = """You are a research assistant. Based on the conversation so far, produce a final research brief.
+            
+                Rules:
+                - Output only a JSON object that matches the required schema. No markdown, no extra text.
+                - Use only information that appeared in the conversation. Do not invent facts or sources.
+                - subject: the main topic of the research, in one short sentence.
+                - Key_Findings: the most important findings, each as one short sentence.
+                - Sources: the sources mentioned in the conversation. If none, return an empty list.
+                - opening_Questions: questions that remain unanswered or need more research. If none, return an empty list.
+                - Recommendation: a short conclusion or suggested next step.
+                - Write all values in the same language the user used in the conversation.""",
+            input = Specialized_input,
+            text_format= format,
+            
 
-
-    response = client.responses.create (
-    model="openai/gpt-oss-20b",
-    input= history,
-    store = False,
-    # stream = True,
-    max_output_tokens=1000,
-    tools = tools
-
-)
-    
-
-    for item in response.output:
-
-        if item.type == "reasoning":
-            continue
+        )
+        response_model = response_parsed.output_parsed
+        print(response_model.model_dump_json(indent=2))
+       
+    else:
         
+        history.append({"role":"user","content":input_text})
+        response = client.responses.create(
+            model = "openai/gpt-oss-20b",
+            input = history,
+            store = False,
+            tools = tools
+        )
+        print(response.output_text)
+        history.append({"role":"assistant","content":response.output_text})
         
 
-        if item.type == "function_call":
-          args = json.loads(item.arguments)    
-          result = send_email(**args)        
-          print(result)    
-          history.append(item)  
-          history.append({"type":item.type,"id":item.call_id,"output":result}) 
+        for i in response.output:
+            if i.type == "reasoning":
+                continue
 
-        else :
-            history.append({"role":"assistant","content":response.output_text})
-            print(response.output_text)
+            if i.type == "function_call" and i.name == "save_notes":
+                args = json.loads(i.arguments)
+                result = save_notes(**args) 
+                history.append(i)
+                history.append({"type":"function_call_output","call_id":i.call_id,"output":result})
+                response1 = client.responses.create(
+                    model = "openai/gpt-oss-20b",
+                    input = history,
+                    store = False,
+                )
+                history.append({"role":"assistant","content":response1.output_text})
+                print(response1.output_text)
+
+            if i.type == "function_call" and i.name == "list_notes":
+                result = list_notes()   #notes[{}]
+                history.append(i)
+                history.append({"type":"function_call_output","call_id":i.call_id,"output":json.dumps(result)})
+                response2 = client.responses.create(
+                    model = "openai/gpt-oss-20b",
+                    input = history,
+                    store = False,
+                )
+                history.append({"role":"assistant","content":response2.output_text})
+                print(response2.output_text)
+        
+
             
         
 
-    #----------------------------------------------------------------------------------------------------
 
-
-
-    
-    print("output",response.output)
-    
-    print("history",history)
-    #streaming
-    # chunks = []
-    # events = []
-    # for event in response:
-    #     if hasattr(event,"type") and event.type== "response.output_text.delta":
-             
-    #         print(event.delta, end="",flush = True) 
-    #         chunks.append(event.delta)
-    #         events.append(event)
-
-
-    # history.append({"role":"assistant","content":"".join(chunks)})
-    
 
 
 
